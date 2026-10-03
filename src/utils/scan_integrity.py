@@ -1,6 +1,6 @@
 import json
 
-from models.const import RELIC_LOCATION
+from models.const import RELIC_LOCATION, RELIC_SLOT
 
 
 class ScanIntegrityError(RuntimeError):
@@ -32,4 +32,24 @@ def validate_relic_records(relics: list[dict]) -> list[dict]:
                 "The scan is incomplete and will not be exported."
             )
         seen[key] = (index, uid)
+    return relics
+
+
+def validate_relic_tab_slots(relics: list[dict], expected_slots: dict[int, str]) -> list[dict]:
+    """Require each relic's parsed slot to match the tab it was captured in (UID -> slot)."""
+    if not expected_slots:
+        return relics
+    for index, relic in enumerate(relics):
+        uid_text = str(relic.get("_uid", ""))
+        if not uid_text.startswith("relic_"):
+            raise ScanIntegrityError(f"Relic at index {index} has no scanner UID; no export.")
+        uid = int(uid_text[len("relic_"):])
+        expected = expected_slots.get(uid)
+        if expected is None:
+            raise ScanIntegrityError(f"Relic UID {uid} was not captured in a slot tab; no export.")
+        slot = relic.get(RELIC_SLOT)
+        if slot != expected:
+            raise ScanIntegrityError(
+                f"Relic UID {uid} is a {slot!r} relic but was captured in the {expected} tab. "
+                "The scan is incomplete and will not be exported.")
     return relics

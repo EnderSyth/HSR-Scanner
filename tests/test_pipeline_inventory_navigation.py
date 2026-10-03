@@ -26,12 +26,19 @@ class PipelineInventoryNavigationTest(unittest.TestCase):
         polls_since_d = [0]
         clock = [0.0]
         events = []
+        def advance(action):
+            self.assertFalse(pending[0], 'second input before prior navigation arrived')
+            pending[0] = True
+            polls_since_d[0] = 0
+            events.append((action, frame[0] + 1))
         def tap(key):
             if key == 'd':
-                self.assertFalse(pending[0], 'second input before prior navigation arrived')
-                pending[0] = True
-                polls_since_d[0] = 0
-                events.append(('d', frame[0] + 1))
+                self.assertNotEqual(frame[0] % 8, 0, 'd cannot wrap to the next row')
+                advance('d')
+        def click():
+            if getattr(scanner, '_inventory_nav_target', None) is not None:
+                self.assertEqual(frame[0] % 8, 0, 'row click must follow column 8')
+                advance('click')
         def grab(bbox):
             clock[0] += .009
             if pending[0]:
@@ -42,6 +49,7 @@ class PipelineInventoryNavigationTest(unittest.TestCase):
             events.append(('grab', frame[0]))
             return Image.new('RGB', (480, 842), (frame[0], 0, 0)), 'fake'
         scanner._nav.key_tap.side_effect = tap
+        scanner._nav.click.side_effect = click
         screenshot._grab_screenshot = grab
         with patch('services.scanner.scanner.image_to_string', side_effect=['53/3000', SORT_RARITY]), \
              patch('services.scanner.scanner.time.sleep'), \
@@ -49,7 +57,8 @@ class PipelineInventoryNavigationTest(unittest.TestCase):
             shards = scanner.scan_inventory(strategy)
         items = [(uid, stats['name'].getpixel((0, 0))[0]) for shard in shards for uid, stats in shard]
         self.assertEqual(items, [(uid, uid) for uid in range(1, 54)])
-        self.assertEqual(sum(kind == 'd' for kind, _ in events), 52)
+        self.assertEqual(sum(kind == 'd' for kind, _ in events), 46)
+        self.assertEqual([uid for kind, uid in events if kind == 'click'], [9, 17, 25, 33, 41, 49])
         self.assertFalse(pending[0])
 
     def run_inventory(self, quantity=53, recent=None, level=0, scan_delay=0, rarities=None):
@@ -83,7 +92,7 @@ class PipelineInventoryNavigationTest(unittest.TestCase):
         self.assertTrue(all(enabled for uid, enabled in allowed[:-1]))
         self.assertFalse(allowed[-1][1])
         self.assertEqual([uid for shard in shards for uid, _ in shard], list(range(1, 54)))
-        self.assertEqual(sum(call.args == ('d',) for call in scanner._nav.key_tap.call_args_list), 52)
+        self.assertEqual(sum(call.args == ('d',) for call in scanner._nav.key_tap.call_args_list), 46)
         self.assertEqual(scanner._inventory_nav_target, 53)
         self.assertEqual(len(shards[0]), 50)
 
@@ -111,6 +120,39 @@ class PipelineInventoryNavigationTest(unittest.TestCase):
     def test_zero_delay_never_calls_sleep_zero_after_navigation(self):
         scanner, _, _ = self.run_inventory(quantity=3)
         self.assertNotIn(((0,), {}), scanner._scan_sleep.call_args_list)
+
+    def test_row_click_coordinates_and_partial_final_row(self):
+        scanner, shards, _ = self.run_inventory(quantity=42)
+        moves = [call.args for call in scanner._nav.move_cursor_to.call_args_list]
+        self.assertEqual(moves[1:], [
+            (0.107, 0.425), (0.107, 0.590), (0.107, 0.755),
+            (0.107, 1230 / 1440), (0.107, 1230 / 1440),
+        ])
+        self.assertEqual(scanner._nav.click.call_count, 6)  # tab + five row starts
+        self.assertEqual(sum(call.args == ('d',) for call in scanner._nav.key_tap.call_args_list), 36)
+        self.assertEqual([uid for shard in shards for uid, _ in shard], list(range(1, 43)))
+        scanner._scan_sleep.assert_not_called()
+
+    def test_stop_on_column_eight_does_not_click_next_row(self):
+        for options in ({'quantity': 8}, {'quantity': 30, 'recent': 8},
+                        {'quantity': 30, 'rarities': {8: 4}}):
+            with self.subTest(options=options):
+                scanner, _, _ = self.run_inventory(**options)
+                self.assertEqual(scanner._nav.click.call_count, 1)  # inventory tab only
+                self.assertEqual(scanner._inventory_nav_target, 8)
+
+    def test_rarity_boundary_on_new_row_preserves_row_major_stop(self):
+        scanner, shards, _ = self.run_inventory(quantity=20, rarities={9: 4})
+        self.assertEqual([uid for shard in shards for uid, _ in shard], list(range(1, 9)))
+        self.assertEqual(scanner._inventory_nav_target, 9)
+        self.assertEqual(scanner._nav.click.call_count, 2)
+        self.assertEqual(sum(call.args == ('d',) for call in scanner._nav.key_tap.call_args_list), 7)
+
+    def test_sequential_delays_apply_to_row_clicks(self):
+        scanner, _, allowed = self.run_inventory(quantity=10, scan_delay=.1)
+        self.assertFalse(any(enabled for _, enabled in allowed))
+        self.assertEqual(scanner._nav.click.call_count, 2)
+        self.assertEqual(sum(call.args == (0,) for call in scanner._scan_sleep.call_args_list), 9)
 
 
 if __name__ == '__main__':

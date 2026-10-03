@@ -249,6 +249,9 @@ class InventoryLoopTest(unittest.TestCase):
         scanner._interruptible_sleep = Mock()
         scanner._profiled_parse_task = Mock(side_effect=lambda *args: args[-1])
         scanner._log = Mock()
+        # Single-pass inventory by default; slot-tab scans have their own tests.
+        scanner._relic_slot_tab_plan = Mock(return_value=[])
+        scanner._close_inventory = Mock()
         strategy = Mock(spec=RelicStrategy)
         from config.relic_scan import RELIC_NAV_DATA
         from enums.increment_type import IncrementType
@@ -264,7 +267,8 @@ class InventoryLoopTest(unittest.TestCase):
         with patch("services.scanner.scanner.image_to_string", side_effect=["53/3000", SORT_RARITY]), patch("services.scanner.scanner.time.sleep"):
             shards = scanner.scan_inventory(strategy)
         self.assertEqual([uid for shard in shards for uid, stats in shard], list(range(1, 54)))
-        self.assertEqual(sum(call.args == ("d",) for call in scanner._nav.key_tap.call_args_list), 52)
+        self.assertEqual(sum(call.args == ("d",) for call in scanner._nav.key_tap.call_args_list), 46)
+        self.assertEqual(scanner._nav.click.call_count, 7)  # tab + six row starts
         self.assertEqual(len(shards[0]), 50)
 
     def test_profile_groups_batch_boundary_without_changing_navigation(self):
@@ -278,7 +282,7 @@ class InventoryLoopTest(unittest.TestCase):
         self.assertEqual([uid for shard in shards for uid, stats in shard], list(range(1, 54)))
         self.assertEqual([r[0] for r in scanner._inventory_profile if r[1] == 'after_shard_1_3'], [51, 52, 53])
         self.assertEqual(len(scanner._inventory_profile), 52)
-        self.assertEqual(sum(call.args == ('d',) for call in scanner._nav.key_tap.call_args_list), 52)
+        self.assertEqual(sum(call.args == ('d',) for call in scanner._nav.key_tap.call_args_list), 46)
 
     def test_exhaustion_does_not_queue_failed_uid_or_advance_again(self):
         scanner, strategy = self.scanner()
@@ -304,3 +308,17 @@ class InventoryLoopTest(unittest.TestCase):
         self.assertEqual(order, ['preflight', 'focus'])
         scanner._open_ocr_gate.assert_called_once()
         scanner._screenshot.close.assert_called_once()
+
+    def test_failed_row_click_is_not_resent_or_exported(self):
+        scanner, strategy = self.scanner()
+        scanner._screenshot.screenshot_stats_on_panel_change.side_effect = [
+            ({"uid": uid}, str(uid).encode()) for uid in range(1, 9)
+        ] + [({"uid": 8}, b"8")] * 3
+        with patch("services.scanner.scanner.image_to_string", side_effect=["10/3000", SORT_RARITY]), patch("services.scanner.scanner.time.sleep"):
+            with self.assertRaises(UnresolvedDuplicateCaptureError) as error:
+                scanner.scan_inventory(strategy)
+        self.assertEqual(error.exception.item_id, 9)
+        self.assertEqual(scanner._inventory_nav_target, 9)
+        self.assertEqual(scanner._nav.click.call_count, 2)  # tab + one row click
+        self.assertEqual(sum(call.args == ("d",) for call in scanner._nav.key_tap.call_args_list), 7)
+        scanner._profiled_parse_task.assert_not_called()

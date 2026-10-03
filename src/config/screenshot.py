@@ -18,6 +18,8 @@ from config.const import (
     NIHILITY,
     PRESERVATION,
     QUANTITY,
+    RELIC_SLOT_LABEL,
+    RELIC_TAB_UNDERLINE,
     RELIC,
     REMEMBRANCE,
     SORT,
@@ -52,6 +54,9 @@ SCREENSHOT_COORDS = {
     ASPECT_16_9: {
         QUANTITY: (0.7882916666666667, 0.032407407407407406, 0.14, 0.06),
         SORT: (0.114, 0.9, 0.09, 0.033),
+        RELIC_TAB_UNDERLINE: (0.10, 0.149, 0.45, 0.008),
+        # (x0, y0, x1, y1) within the relic STATS image, unlike the entries above.
+        RELIC_SLOT_LABEL: (0.07, 0.205, 0.40, 0.255),
         UID: (0.68958, 0.02129, 0.063, 0.02129),
         CHARACTER: {
             COUNT: (0.5525, 0.55, 0.0635, 0.0425),

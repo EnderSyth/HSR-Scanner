@@ -22,6 +22,8 @@ from config.const import (
     CHEST,
     COUNT,
     QUANTITY,
+    RELIC_SLOT_LABEL,
+    RELIC_TAB_UNDERLINE,
     SORT,
     STATS,
     TRACES,
@@ -249,6 +251,20 @@ class Screenshot:
         :return: The screenshot
         """
         return self._take_screenshot(*SCREENSHOT_COORDS[self._aspect_ratio][QUANTITY])
+
+    def screenshot_relic_tab_underline(self) -> Image:
+        """Strip under the relic filter tabs; the selected tab is underlined."""
+        return self._take_screenshot(
+            *SCREENSHOT_COORDS[self._aspect_ratio][RELIC_TAB_UNDERLINE], do_not_save=True
+        )
+
+    def screenshot_relic_slot_label(self) -> Image:
+        """Slot name of the selected relic, cropped from the details panel."""
+        coords = SCREENSHOT_COORDS[self._aspect_ratio]
+        panel = self._take_screenshot(*coords[STATS], do_not_save=True)
+        x0, y0, x1, y1 = coords[RELIC_SLOT_LABEL]
+        width, height = panel.size
+        return panel.crop((int(x0 * width), int(y0 * height), int(x1 * width), int(y1 * height)))
 
     def screenshot_character_count(self) -> Image:
         """Takes a screenshot of the character count. Requires
@@ -553,6 +569,7 @@ class Screenshot:
                 if not navigation_issued:
                     advance = None
         poll_end = time.perf_counter()
+        self.last_capture_signature_changes = signature_changes
         if profile:
             self._trace_capture(('accept' if settled else 'timeout', key, uid, '', polls,
                                  '', '', poll_end, '', '', signature_changes, '', decision))

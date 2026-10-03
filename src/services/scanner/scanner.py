@@ -19,7 +19,10 @@ from config.const import (
     DETAILS_BUTTON,
     EIDOLONS_BUTTON,
     FIRST_ITEM,
+    INVENTORY_FILTER_TABS,
+    INVENTORY_ROW_STARTS,
     INV_TAB,
+    RELIC_TAB_UNDERLINE,
     SORT_BUTTON,
     TRACES,
     TRACES_BUTTON,
@@ -69,6 +72,7 @@ from models.game_data import GameData
 from services.scanner.parsers.parse_strategy import BaseParseStrategy
 from utils.data import resource_path
 from utils.duplicate_capture import recover_duplicate_capture
+from utils.inventory_tabs import parse_quantity, same_label, selected_tab_index
 from utils.navigation import Navigation
 from utils.ocr import (
     image_to_string,
@@ -85,7 +89,11 @@ from utils.ocr_profile import (
     reset_ocr_profile,
 )
 from utils.screenshot import Screenshot
-from utils.scan_integrity import validate_relic_records
+from utils.scan_integrity import (
+    ScanIntegrityError,
+    validate_relic_records,
+    validate_relic_tab_slots,
+)
 from utils.window import bring_window_to_foreground
 
 from .parsers.character_parser import CharacterParser
@@ -101,6 +109,10 @@ class InterruptedScanException(Exception):
     pass
 
 
+class InventoryTabEnd(Exception):
+    """The selected relic is the last one in the current filter tab."""
+
+
 class HSRScanner(QObject):
     """HSRScanner class is responsible for scanning the game for light cones, relics, and characters"""
 
@@ -109,6 +121,17 @@ class HSRScanner(QObject):
     PANEL_CHANGE_TIMEOUT = 0.75
     PANEL_SETTLE_TIME = 0.0  # Two matching observations, no fixed per-item wait.
     POST_NAV_BASE_DELAY = 0.0
+
+    # The game's FPS decays (60 to ~15 over ~3000 relics) while one inventory stays
+    # open; reopening resets it. So relics are scanned per slot tab, each from a
+    # freshly opened inventory.
+    INVENTORY_CLOSE_TIMEOUT = 20.0
+    INVENTORY_CLOSED_OBSERVATIONS = 3
+    INVENTORY_OPEN_TIMEOUT = 10.0
+    INVENTORY_OPEN_ATTEMPTS = 2
+    INVENTORY_TAB_STATE_TIMEOUT = 5.0
+    SCREEN_STATE_POLL = 0.05
+    TAB_END_PROBE_TIMEOUT = 1.5
 
     update_signal = pyqtSignal(int)
     log_signal = pyqtSignal(object)
@@ -212,15 +235,28 @@ class HSRScanner(QObject):
         profile = self._config.get(CONFIG_DEBUG, False)
         capture_start = time.perf_counter() if profile else 0.0
         incoming_nav_start = getattr(self, '_profile_nav_start', None)
+        # In a slot tab, an unchanged panel may mean the tab has ended.
+        tab_end_possible = [
+            getattr(self, '_inventory_tab', None) is not None
+            and previous_stats_panel_bytes is not None
+            and getattr(self, '_inventory_nav_target', None) == item_id
+        ]
         def capture():
             advance = None
             if (getattr(self, '_pipeline_allowed', False)
                     and getattr(self, '_inventory_nav_target', None) != item_id + 1):
                 advance = lambda raw, key: self._advance_inventory_candidate(item_id, raw, key)
             self._screenshot.configure_inventory_capture(item_id, advance, self._check_capture_interrupt)
-            return self._screenshot.screenshot_stats_on_panel_change(
+            result = self._screenshot.screenshot_stats_on_panel_change(
                 strategy.SCAN_TYPE, previous_stats_panel_bytes,
                 self.PANEL_CHANGE_TIMEOUT, self.PANEL_SETTLE_TIME)
+            if tab_end_possible[0]:
+                tab_end_possible[0] = False
+                if (result[1] == previous_stats_panel_bytes
+                        and getattr(self._screenshot, 'last_capture_signature_changes', None) == 0):
+                    self._confirm_inventory_tab_end(strategy, item_id, previous_stats_panel_bytes)
+                    raise InventoryTabEnd()
+            return result
         result = recover_duplicate_capture(
             capture,
             previous_stats_panel_bytes,
@@ -261,7 +297,8 @@ class HSRScanner(QObject):
         if attempt == 0:
             self._log(
                 f"Item UID {item_id}: item {item_id - 1} was accepted and one "
-                "forward ('d') navigation input was issued, but the details "
+                f"navigation input ({getattr(self, '_inventory_nav_action', 'd')}) "
+                "was issued, but the details "
                 "signature still matches the prior item. This may be an "
                 "unaccepted navigation input or a stale details panel; recovery "
                 "will capture only and will not resend navigation.",
@@ -291,14 +328,28 @@ class HSRScanner(QObject):
         self._check_capture_interrupt()
         self._screenshot.remember_inventory_before_navigation()
         nav_start = time.perf_counter()
-        self._nav.key_tap("d")
+        row_starts = getattr(self, '_inventory_row_starts', None)
+        # Grid position within the current tab; UIDs continue across tabs.
+        position = item_id - getattr(self, '_inventory_tab_offset', 0)
+        if row_starts and position % 8 == 0:
+            # 'd' doesn't wrap rows, so click each row's first tile. Later rows are
+            # clicked in the row-5 slot; the next 'd' scrolls the grid up a row.
+            row_index = min(position // 8, len(row_starts) - 1)
+            self._nav.move_cursor_to(*row_starts[row_index])
+            self._nav.click()
+            self._inventory_nav_action = 'row-start click'
+        else:
+            self._nav.key_tap("d")
+            self._inventory_nav_action = 'd'
         nav_end = time.perf_counter()
+        self._screenshot._inventory_nav_action = self._inventory_nav_action
         self._inventory_nav_target = item_id + 1
         self._profile_nav_start = nav_start
         if not pipeline:
             if self._config.get(CONFIG_DEBUG, False):
                 self._screenshot._trace_capture(('nav', getattr(self, '_inventory_type', ''),
-                    item_id, item_id + 1, '', nav_start, nav_end, '', '', '', '', '', 'issued'))
+                    item_id, item_id + 1, '', nav_start, nav_end, '', '', '', '',
+                    self._inventory_nav_action, 'issued'))
             delay = self._config.get(CONFIG_SCAN_DELAY, 0)
             if delay:
                 self._scan_sleep(0)
@@ -382,6 +433,7 @@ class HSRScanner(QObject):
         )
         relic_results = self._flatten_scan_results(await asyncio.gather(*relics))
         validate_relic_records(relic_results)
+        validate_relic_tab_slots(relic_results, getattr(self, '_relic_tab_slots', {}))
         character_results = self._flatten_scan_results(
             await asyncio.gather(*characters)
         )
@@ -506,6 +558,7 @@ class HSRScanner(QObject):
         :return: The tasks to await
         """
         nav_data = strategy.NAV_DATA[self._aspect_ratio]
+        self._inventory_row_starts = nav_data.get(INVENTORY_ROW_STARTS)
 
         # Navigate to correct tab from cellphone menu
         self._nav_sleep(1)
@@ -643,80 +696,125 @@ class HSRScanner(QObject):
                 )
             return quantity_remaining <= 0
 
-        while not should_stop():
-            item_id = quantity - quantity_remaining + 1
-            self._pipeline_allowed = (
-                pipeline_safe and quantity_remaining > 1
-                and (not recent_mode or scanned + 1 < self._config[CONFIG_RECENT_RELICS_NUM])
+        tab_plan = self._relic_slot_tab_plan(strategy, nav_data)
+        self._inventory_tab = None
+        self._inventory_tab_offset = 0
+        stopped_by_filter = False
+        if tab_plan:
+            self._relic_tab_slots = {}
+            self._log(
+                "Scanning relics one slot tab at a time, reopening the inventory "
+                "before each tab to reset the game's inventory slowdown.",
+                LogLevel.DEBUG,
             )
-            stats_dict, stats_panel_bytes = self._capture_inventory_stats(
-                strategy, item_id, previous_stats_panel_bytes
+        for tab_index, tab_slot in enumerate(tab_plan or [None]):
+            if should_stop():
+                break
+            if tab_slot is not None:
+                if tab_index > 0:
+                    self._reopen_relic_inventory(nav_data, quantity)
+                self._begin_relic_slot_tab(nav_data, tab_slot, current_sort_method)
+                self._inventory_tab = tab_slot
+                self._inventory_tab_offset = quantity - quantity_remaining
+                self._inventory_nav_target = None
+                previous_stats_panel_bytes = None
+                self._screenshot.reset_inventory_pipeline()
+            while not should_stop():
+                item_id = quantity - quantity_remaining + 1
+                self._pipeline_allowed = (
+                    pipeline_safe and quantity_remaining > 1
+                    and (not recent_mode or scanned + 1 < self._config[CONFIG_RECENT_RELICS_NUM])
+                )
+                try:
+                    stats_dict, stats_panel_bytes = self._capture_inventory_stats(
+                        strategy, item_id, previous_stats_panel_bytes
+                    )
+                except InventoryTabEnd:
+                    break
+                previous_stats_panel_bytes = stats_panel_bytes
+                quantity_remaining -= 1
+                if tab_slot is not None:
+                    self._relic_tab_slots[item_id] = tab_slot
+
+                # Check if item satisfies filters
+                if FILTERS in self._config:
+                    filter_results, stats_dict = strategy.check_filters(
+                        stats_dict,
+                        self._config[FILTERS],
+                        item_id,
+                    )
+                    if (
+                        current_sort_method == SORT_LV
+                        and MIN_LEVEL in filter_results
+                        and not filter_results[MIN_LEVEL]
+                    ):
+                        stopped_by_filter = True
+                        if tab_slot is None:
+                            quantity_remaining = 0
+                        self._log(
+                            f"Reached minimum level filter (got level {stats_dict[LEVEL]})"
+                            + (f" in the {tab_slot} tab." if tab_slot else ".")
+                        )
+                        break
+                    if (
+                        current_sort_method == SORT_RARITY
+                        and MIN_RARITY in filter_results
+                        and not filter_results[MIN_RARITY]
+                    ):
+                        stopped_by_filter = True
+                        if tab_slot is None:
+                            quantity_remaining = 0
+                        self._log(
+                            f"Reached minimum rarity filter (got rarity {stats_dict[RARITY]})"
+                            + (f" in the {tab_slot} tab." if tab_slot else ".")
+                        )
+                        break
+                    if (
+                        self._scan_mode == ScanMode.RECENT_RELICS.value
+                        and current_sort_method == SORT_DATE
+                        and MIN_RARITY in filter_results
+                        and filter_results[MIN_RARITY]
+                    ):
+                        scanned += 1
+                    if not all(filter_results.values()):
+                        if not should_stop():
+                            self._advance_inventory(item_id)
+                        continue
+
+                # Update UI count
+                self.update_signal.emit(strategy.SCAN_TYPE.value)
+
+                if isinstance(strategy, RelicStrategy):
+                    batch_items.append((item_id, stats_dict))
+                    batch_total += 1
+                    if len(batch_items) >= self._ocr_batch_size:
+                        submit_batch_shard(batch_items)
+                        batch_items = []
+                else:
+                    task = self._profiled_parse_task(
+                        strategy.SCAN_TYPE.name.lower(),
+                        item_id,
+                        strategy.__class__.__name__,
+                        strategy.parse,
+                        stats_dict,
+                        item_id,
+                    )
+                    tasks.append(task)
+
+                # Next item
+                if not should_stop():
+                    self._advance_inventory(item_id)
+            if tab_slot is not None:
+                self._log(
+                    f"{tab_slot} tab: {quantity - quantity_remaining - self._inventory_tab_offset} "
+                    "relics captured.", LogLevel.DEBUG)
+        self._inventory_tab = None
+        self._inventory_tab_offset = 0
+        if tab_plan and not stopped_by_filter and quantity_remaining > 0:
+            raise ScanIntegrityError(
+                f"Relic slot tabs held {quantity - quantity_remaining} relics but the "
+                f"inventory reports {quantity}. The scan is incomplete and will not be exported."
             )
-            previous_stats_panel_bytes = stats_panel_bytes
-            quantity_remaining -= 1
-
-            # Check if item satisfies filters
-            if FILTERS in self._config:
-                filter_results, stats_dict = strategy.check_filters(
-                    stats_dict,
-                    self._config[FILTERS],
-                    item_id,
-                )
-                if (
-                    current_sort_method == SORT_LV
-                    and MIN_LEVEL in filter_results
-                    and not filter_results[MIN_LEVEL]
-                ):
-                    quantity_remaining = 0
-                    self._log(
-                        f"Reached minimum level filter (got level {stats_dict[LEVEL]})."
-                    )
-                    break
-                if (
-                    current_sort_method == SORT_RARITY
-                    and MIN_RARITY in filter_results
-                    and not filter_results[MIN_RARITY]
-                ):
-                    quantity_remaining = 0
-                    self._log(
-                        f"Reached minimum rarity filter (got rarity {stats_dict[RARITY]})."
-                    )
-                    break
-                if (
-                    self._scan_mode == ScanMode.RECENT_RELICS.value
-                    and current_sort_method == SORT_DATE
-                    and MIN_RARITY in filter_results
-                    and filter_results[MIN_RARITY]
-                ):
-                    scanned += 1
-                if not all(filter_results.values()):
-                    if not should_stop():
-                        self._advance_inventory(item_id)
-                    continue
-
-            # Update UI count
-            self.update_signal.emit(strategy.SCAN_TYPE.value)
-
-            if isinstance(strategy, RelicStrategy):
-                batch_items.append((item_id, stats_dict))
-                batch_total += 1
-                if len(batch_items) >= self._ocr_batch_size:
-                    submit_batch_shard(batch_items)
-                    batch_items = []
-            else:
-                task = self._profiled_parse_task(
-                    strategy.SCAN_TYPE.name.lower(),
-                    item_id,
-                    strategy.__class__.__name__,
-                    strategy.parse,
-                    stats_dict,
-                    item_id,
-                )
-                tasks.append(task)
-
-            # Next item
-            if not should_stop():
-                self._advance_inventory(item_id)
 
         if batch_items:
             # Split the remainder across workers so the post-capture tail
@@ -730,11 +828,140 @@ class HSRScanner(QObject):
                 f"{batch_shard_count} streamed shard(s).",
                 LogLevel.DEBUG,
             )
-        self._nav.key_tap(Key.esc)
-        self._nav_sleep(2)
+        self._close_inventory()
         self._nav.key_tap(Key.esc)
         self._nav_sleep(1)
         return tasks
+
+    def _relic_slot_tab_plan(self, strategy: BaseParseStrategy, nav_data: dict) -> list[str]:
+        """Slot tabs to scan in order; empty for one pass over All (recent-relics mode)."""
+        if (not isinstance(strategy, RelicStrategy)
+                or self._scan_mode == ScanMode.RECENT_RELICS.value):
+            return []
+        return [name for name, _ in nav_data.get(INVENTORY_FILTER_TABS, ()) if name != "All"]
+
+    def _wait_for_screen(self, condition, timeout_s: float) -> bool:
+        """Poll ``condition`` until it holds or ``timeout_s`` passes."""
+        deadline = time.perf_counter() + timeout_s
+        while True:
+            self._check_capture_interrupt()
+            if condition():
+                return True
+            if time.perf_counter() >= deadline:
+                return False
+            time.sleep(self.SCREEN_STATE_POLL)
+
+    def _read_inventory_quantity(self) -> tuple[int, int] | None:
+        """The inventory's count/capacity, or None when no inventory is showing."""
+        with ocr_profile_context(item_type="inventory", uid="inventory", field="quantity_state", phase="scan"):
+            text = image_to_string(self._screenshot.screenshot_quantity(), "0123456789/", 7)
+        return parse_quantity(text)
+
+    def _close_inventory(self) -> None:
+        """Press Esc and wait until the inventory is gone, which can take seconds."""
+        self._nav.key_tap(Key.esc)
+        closed = [0]
+
+        def stays_closed():
+            closed[0] = closed[0] + 1 if self._read_inventory_quantity() is None else 0
+            return closed[0] >= self.INVENTORY_CLOSED_OBSERVATIONS
+
+        if not self._wait_for_screen(stays_closed, self.INVENTORY_CLOSE_TIMEOUT):
+            raise ScanIntegrityError(
+                f"The inventory did not close within {self.INVENTORY_CLOSE_TIMEOUT:.0f}s of Esc; "
+                "scan aborted.")
+
+    def _reopen_relic_inventory(self, nav_data: dict, quantity: int) -> None:
+        """Close and reopen the inventory, returning to the relic category."""
+        self._close_inventory()
+        for attempt in range(1, self.INVENTORY_OPEN_ATTEMPTS + 1):
+            self._nav.key_tap(self._config[CONFIG_INVENTORY_KEY])
+            if self._wait_for_screen(
+                    lambda: self._read_inventory_quantity() is not None,
+                    self.INVENTORY_OPEN_TIMEOUT):
+                break
+            self._log(f"Inventory did not open (attempt {attempt}).", LogLevel.WARNING)
+        else:
+            raise ScanIntegrityError("The inventory did not reopen; scan aborted.")
+
+        def showing_relics():
+            current = self._read_inventory_quantity()
+            return current is not None and current[0] == quantity
+
+        if not showing_relics():
+            self._nav.move_cursor_to(*nav_data[INV_TAB])
+            self._nav.click()
+            if not self._wait_for_screen(showing_relics, self.INVENTORY_OPEN_TIMEOUT):
+                raise ScanIntegrityError(
+                    f"The reopened inventory did not show {quantity} relics; scan aborted.")
+
+    def _selected_relic_tab(self, nav_data: dict) -> str | None:
+        tabs = nav_data[INVENTORY_FILTER_TABS]
+        x, _, width, _ = SCREENSHOT_COORDS[self._aspect_ratio][RELIC_TAB_UNDERLINE]
+        index = selected_tab_index(
+            self._screenshot.screenshot_relic_tab_underline(),
+            [position[0] for _, position in tabs], x, width)
+        return None if index is None else tabs[index][0]
+
+    def _read_relic_slot_label(self) -> str:
+        with ocr_profile_context(item_type="relic", uid="inventory", field="slot_tab", phase="scan"):
+            return image_to_string(
+                self._screenshot.screenshot_relic_slot_label(),
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ", 7)
+
+    def _begin_relic_slot_tab(self, nav_data: dict, slot: str, sort_method: str) -> None:
+        """Select a slot tab and its first relic, confirming each step on screen."""
+        position = dict(nav_data[INVENTORY_FILTER_TABS])[slot]
+        for _ in range(2):
+            self._nav.move_cursor_to(*position)
+            self._nav.click()
+            if self._wait_for_screen(
+                    lambda: self._selected_relic_tab(nav_data) == slot,
+                    self.INVENTORY_TAB_STATE_TIMEOUT):
+                break
+        else:
+            raise ScanIntegrityError(f"The {slot} relic tab could not be confirmed; scan aborted.")
+        with ocr_profile_context(item_type="relic", uid="inventory", field="sort", phase="scan"):
+            current_sort = image_to_string(
+                self._screenshot.screenshot_sort(), "RarityLvDate obtained", 7)
+        if current_sort != sort_method:
+            raise ScanIntegrityError(
+                f"The {slot} relic tab is sorted by {current_sort!r}, expected "
+                f"{sort_method!r}; scan aborted.")
+        self._select_first_inventory_item(nav_data)
+        # Otherwise the previous tab's relic could be recorded under this one.
+        if not self._wait_for_screen(
+                lambda: same_label(self._read_relic_slot_label(), slot),
+                self.INVENTORY_TAB_STATE_TIMEOUT):
+            raise ScanIntegrityError(
+                f"The details panel did not show a {slot} relic after selecting its tab; "
+                "scan aborted.")
+        self._log(f"Scanning the {slot} tab.", LogLevel.DEBUG)
+
+    def _confirm_inventory_tab_end(self, strategy: BaseParseStrategy, item_id: int,
+                                   previous_panel_bytes: bytes) -> None:
+        """Confirm the tab ended: a second input (``d`` mid-row, ``s`` at a row end) must
+        also leave the panel unchanged, otherwise the scan aborts."""
+        position = item_id - 1 - self._inventory_tab_offset
+        probe = 's' if position % 8 == 0 else 'd'
+        foreground = win32gui.GetForegroundWindow()
+        if foreground != self._hwnd:
+            raise ScanIntegrityError(
+                f"Item UID {item_id}: the panel did not change and the game is not the "
+                "foreground window; scan aborted.")
+        self._nav.key_tap(probe)
+        self._screenshot.configure_inventory_capture(item_id, None, self._check_capture_interrupt)
+        _, panel_bytes = self._screenshot.screenshot_stats_on_panel_change(
+            strategy.SCAN_TYPE, previous_panel_bytes,
+            self.TAB_END_PROBE_TIMEOUT, self.PANEL_SETTLE_TIME)
+        if (panel_bytes != previous_panel_bytes
+                or getattr(self._screenshot, 'last_capture_signature_changes', None) != 0):
+            raise ScanIntegrityError(
+                f"Item UID {item_id}: navigation left the panel unchanged, but a confirming "
+                f"'{probe}' changed it. The selection is uncertain; scan aborted.")
+        self._log(
+            f"{self._inventory_tab} tab ended after UID {item_id - 1} (position {position}); "
+            f"confirmed by an unchanged panel after '{probe}'.", LogLevel.DEBUG)
 
     def scan_characters(self) -> set[asyncio.Task]:
         """Scans the characters
