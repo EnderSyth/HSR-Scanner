@@ -498,7 +498,8 @@ class Screenshot:
             except BaseException:
                 if profile and pending_nav is not None:
                     self._trace_capture(('nav', key, uid, uid + 1, polls - 1,
-                                         *pending_nav, '', '', '', '', '', 'issued'))
+                                         *pending_nav, '', '', '', '',
+                                         getattr(self, '_inventory_nav_action', ''), 'issued'))
                 if profile:
                     self._trace_capture(('abort', key, uid, '', polls, '', '',
                                          time.perf_counter(), '', '', signature_changes, source, 'exception'))
@@ -519,7 +520,8 @@ class Screenshot:
                     first_change_at = signature_end
                 if pending_nav is not None:
                     self._trace_capture(('nav', key, uid, uid + 1, polls - 1,
-                                         *pending_nav, '', '', '', '', '', 'issued'))
+                                         *pending_nav, '', '', '', '',
+                                         getattr(self, '_inventory_nav_action', ''), 'issued'))
                     pending_nav = None
                 trace_times = cached_times if source == 'cache' else (grab_start, grab_end, signature_end)
                 self._trace_capture(('poll', key, uid, '', polls, *trace_times, not changed,
